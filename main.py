@@ -11,14 +11,17 @@ from datetime import datetime, timedelta
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, Boolean, Float, Text, Date, func, Numeric, LargeBinary, text
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from sqlalchemy.dialects.postgresql import UUID, BYTEA
-import cv2
 import numpy as np
-from deepface import DeepFace
+import requests
 import tempfile
 import json
 
 # Load .env file
 load_dotenv()
+
+# --- AI CONFIG ---
+HF_API_URL = os.getenv("HF_API_URL") # URL of your Hugging Face Space (e.g., https://user-space.hf.space)
+HF_TOKEN = os.getenv("HF_TOKEN")      # Optional: if Space is private
 
 # --- DATABASE SETUP ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -963,22 +966,24 @@ async def verify_face(
 
             try:
                 if not student.face_embedding:
-                    # FIRST TIME: Extract and Store Embedding
+                    # FIRST TIME: Extract and Store Embedding via HF Space
                     print(f"--- REGISTRATION: Extracting Face Embedding for {user.username} ---")
 
-                    objs = DeepFace.represent(
-                        img_path = current_path,
-                        model_name = "VGG-Face",
-                        detector_backend = "mtcnn", # Changed from opencv for better detection
-                        enforce_detection = True
-                    )
+                    # Seek to beginning of file for requests
+                    await image.seek(0)
+                    files = {"image": (image.filename, await image.read(), image.content_type)}
 
-                    if objs:
-                        embedding = objs[0]["embedding"]
+                    response = requests.post(f"{HF_API_URL}/represent", files=files, timeout=60)
+                    result = response.json()
+
+                    if result.get("success"):
+                        embedding = result["embedding"]
                         # Store as JSON string for compatibility
                         student.face_embedding = json.dumps(embedding).encode('utf-8')
 
                         # ALWAYS: Store the actual image binary in Supabase and locally
+                        await image.seek(0)
+                        image_bytes = await image.read()
                         student.face_image = image_bytes
                         db.commit()
 
@@ -990,43 +995,31 @@ async def verify_face(
 
                         is_verified = True
                         msg = "Face registered and attendance marked!"
-                        print(f"+++ REGISTRATION SUCCESS: {user.username} (Saved to Supabase & Local) +++")
+                        print(f"+++ REGISTRATION SUCCESS: {user.username} (via HF Space) +++")
                     else:
-                        return {"success": False, "message": "Could not detect face for registration."}
+                        return {"success": False, "message": f"AI Error: {result.get('error', 'Face not detected')}"}
                 else:
-                    # SUBSEQUENT TIMES: Verify Embedding
+                    # SUBSEQUENT TIMES: Verify Embedding via HF Space
                     print(f"--- VERIFICATION: Comparing embedding for {user.username} ---")
 
-                    objs = DeepFace.represent(
-                        img_path = current_path,
-                        model_name = "VGG-Face",
-                        detector_backend = "mtcnn", # Changed from opencv for better detection
-                        enforce_detection = True
-                    )
+                    stored_embedding_str = student.face_embedding.decode('utf-8')
 
-                    if not objs:
-                        raise HTTPException(status_code=400, detail="Could not detect face in current scan.")
+                    await image.seek(0)
+                    files = {"image": (image.filename, await image.read(), image.content_type)}
+                    data = {"stored_embedding": stored_embedding_str}
 
-                    current_emb = np.array(objs[0]["embedding"])
-                    stored_emb = np.array(json.loads(student.face_embedding.decode('utf-8')))
+                    response = requests.post(f"{HF_API_URL}/verify", files=files, data=data, timeout=60)
+                    result = response.json()
 
-                    # Calculate Cosine Distance using numpy
-                    dot_product = np.dot(current_emb, stored_emb)
-                    norm_current = np.linalg.norm(current_emb)
-                    norm_stored = np.linalg.norm(stored_emb)
-                    cosine_similarity = dot_product / (norm_current * norm_stored)
-                    dist = 1 - cosine_similarity
+                    if not result.get("success"):
+                        raise HTTPException(status_code=400, detail=f"AI Error: {result.get('error', 'Processing failed')}")
 
-                    print(f"DEBUG: Cosine Distance: {dist}")
-
-                    # Threshold for VGG-Face is typically 0.40
-                    if dist < 0.40:
-                        print(f"+++ MATCH FOUND (Distance: {dist}) +++")
+                    if result.get("is_match"):
+                        print(f"+++ MATCH FOUND (Distance: {result.get('distance')}) +++")
                         is_verified = True
                         msg = "Face verified and attendance marked!"
                     else:
-                        print(f"!!! NO MATCH (Distance: {dist}) !!!")
-                        # Use 401 Unauthorized for face mismatch to trigger error UI in App
+                        print(f"!!! NO MATCH (Distance: {result.get('distance')}) !!!")
                         raise HTTPException(status_code=401, detail="Face does not match our records!")
 
             except HTTPException as he:
