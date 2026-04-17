@@ -1,25 +1,25 @@
 # Build Tools
-setuptools
-wheel
+setuptools==68.0.0
+wheel==0.40.0
 
 # Base Server
-fastapi
-uvicorn[standard]
-gunicorn
+fastapi==0.103.1
+uvicorn[standard]==0.23.2
+gunicorn==21.2.0
 
 # Core Logic
-pydantic<2.0.0
-python-multipart
-python-dotenv
+pydantic==1.10.12
+python-multipart==0.0.6
+python-dotenv==1.0.0
 
 # Database
-sqlalchemy
-psycopg2-binary
-passlib[bcrypt]
+sqlalchemy==2.0.20
+psycopg2-binary==2.9.7
+passlib[bcrypt]==1.7.4
 
-# AI & Image Processing
-opencv-python-headless
-numpy<1.25.0
+# AI & Image Processing (Strictly Pinned to avoid backtracking)
+numpy==1.24.3
+opencv-python-headless==4.8.0.76
 deepface==0.0.79
-tf-keras
-tensorflow-cpu
+tensorflow-cpu==2.13.0
+tf-keras==2.13.0
