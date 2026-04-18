@@ -436,11 +436,6 @@ async def signup(user_data: dict = Body(...), db: Session = Depends(get_db)):
     print(f"Successfully created user: {user_data.get('email')} with ID: {new_user_id}")
     return {"success": True, "user_id": new_user_id, "role": user_data.get("role"), "name": user_data.get("full_name")}
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # This logic moved up to app definition
-    yield
-
 @app.get("/classrooms")
 async def get_classrooms(db: Session = Depends(get_db)):
     rooms = db.query(Classroom).all()
