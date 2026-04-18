@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 import os
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Body, UploadFile, File, Form, Depends, Response
@@ -11,14 +12,28 @@ from datetime import datetime, timedelta
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, ForeignKey, Boolean, Float, Text, Date, func, Numeric, LargeBinary, text
 from sqlalchemy.orm import sessionmaker, Session, declarative_base
 from sqlalchemy.dialects.postgresql import UUID, BYTEA
-import cv2
 import numpy as np
-from deepface import DeepFace
+import requests
 import tempfile
 import json
+import traceback
+try:
+    from deepface import DeepFace
+except ImportError:
+    DeepFace = None
+
+# --- DEBUG SETTINGS ---
+# Set this to False to use Hugging Face AI (Production)
+OFFLINE_DEBUG_MODE = False
+
+# --- AI CONFIG ---
 
 # Load .env file
 load_dotenv()
+
+# --- AI CONFIG ---
+HF_API_URL = os.getenv("HF_API_URL") # URL of your Hugging Face Space (e.g., https://user-space.hf.space)
+HF_TOKEN = os.getenv("HF_TOKEN")      # Optional: if Space is private
 
 # --- DATABASE SETUP ---
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -247,10 +262,48 @@ def get_db():
     finally:
         db.close()
 
+def clean_id(raw_id: str) -> str:
+    return raw_id.strip().replace("\"", "").replace("'", "")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- SEED DATA FOR TESTING ---
+    db = SessionLocal()
+    try:
+        if db.query(User).count() == 0:
+            print("--- Seeding Initial Test Data ---")
+            # Create a Test Faculty
+            fac_id = "FAC001"
+            fac_user = User(id=fac_id, username="faculty", email="fac@vjti.ac.in", password_hash="123456", full_name="Dr. VJTI Faculty", role="faculty")
+            db.add(fac_user)
+            db.add(Teacher(id=fac_id, full_name="Dr. VJTI Faculty", employee_id="FAC001", branch="Information Technology", designation="Professor"))
+
+            # Create a Test Student
+            stu_id = "ST001"
+            stu_user = User(id=stu_id, username="student", email="stu@vjti.ac.in", password_hash="123456", full_name="Shubham Student", role="student")
+            db.add(stu_user)
+            db.add(Student(id=stu_id, full_name="Shubham Student", registration_number="ST001", branch="Information Technology", year="Second Year"))
+
+            # Create a Classroom and Subject
+            room = Classroom(id="ROOM001", name="Room 101", wifi_bssid="00:11:22:33:44:55")
+            sub = Subject(id="SUB001", name="DBMS", code="CS301", branch="Computer Engineering", year="Third Year")
+            db.add(room)
+            db.add(sub)
+            db.commit()
+            print("--- Seed Data Created! ---")
+            print("Login with: faculty / 123456  OR  student / 123456")
+        else:
+            print(f"--- Database already has {db.query(User).count()} users. Skipping seed. ---")
+    except Exception as e:
+        print(f"--- Seeding Error: {e} ---")
+    finally:
+        db.close()
+    yield
+
 Base.metadata.create_all(engine)
 run_migrations(engine)
 
-app = FastAPI(title="AttendX - Professional Backend")
+app = FastAPI(title="AttendX - Professional Backend", lifespan=lifespan)
 
 @app.middleware("http")
 async def db_session_middleware(request, call_next):
@@ -381,41 +434,12 @@ async def signup(user_data: dict = Body(...), db: Session = Depends(get_db)):
 
     db.commit()
     print(f"Successfully created user: {user_data.get('email')} with ID: {new_user_id}")
-    return {"success": True, "user_id": new_user_id}
+    return {"success": True, "user_id": new_user_id, "role": user_data.get("role"), "name": user_data.get("full_name")}
 
-# --- SEED DATA FOR TESTING ---
-@app.on_event("startup")
-def seed_data():
-    db = SessionLocal()
-    try:
-        if db.query(User).count() == 0:
-            print("--- Seeding Initial Test Data ---")
-            # Create a Test Faculty
-            fac_id = "FAC001"
-            fac_user = User(id=fac_id, username="faculty", email="fac@vjti.ac.in", password_hash="123456", full_name="Dr. VJTI Faculty", role="faculty")
-            db.add(fac_user)
-            db.add(Teacher(id=fac_id, full_name="Dr. VJTI Faculty", employee_id="FAC001", branch="Information Technology", designation="Professor"))
-
-            # Create a Test Student
-            stu_id = "ST001"
-            stu_user = User(id=stu_id, username="student", email="stu@vjti.ac.in", password_hash="123456", full_name="Shubham Student", role="student")
-            db.add(stu_user)
-            db.add(Student(id=stu_id, full_name="Shubham Student", registration_number="ST001", branch="Information Technology", year="Second Year"))
-
-            # Create a Classroom and Subject
-            room = Classroom(id="ROOM001", name="Room 101", wifi_bssid="00:11:22:33:44:55")
-            sub = Subject(id="SUB001", name="DBMS", code="CS301", branch="Computer Engineering", year="Third Year")
-            db.add(room)
-            db.add(sub)
-            db.commit()
-            print("--- Seed Data Created! ---")
-            print("Login with: faculty / 123456  OR  student / 123456")
-        else:
-            print(f"--- Database already has {db.query(User).count()} users. Skipping seed. ---")
-    except Exception as e:
-        print(f"--- Seeding Error: {e} ---")
-    finally:
-        db.close()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # This logic moved up to app definition
+    yield
 
 @app.get("/classrooms")
 async def get_classrooms(db: Session = Depends(get_db)):
@@ -962,23 +986,72 @@ async def verify_face(
                 f.write(image_bytes)
 
             try:
-                if not student.face_embedding:
-                    # FIRST TIME: Extract and Store Embedding
+                if OFFLINE_DEBUG_MODE and DeepFace:
+                    print(f"--- LOCAL AI: Processing {user.username} ---")
+                    try:
+                        objs = DeepFace.represent(
+                            img_path=current_path,
+                            model_name="VGG-Face",
+                            detector_backend="mtcnn",
+                            enforce_detection=True
+                        )
+                        if not objs:
+                            raise HTTPException(status_code=400, detail="No face detected in image")
+
+                        current_embedding = objs[0]["embedding"]
+
+                        if not student.face_embedding:
+                            # Registration
+                            student.face_embedding = json.dumps(current_embedding).encode('utf-8')
+                            student.face_image = image_bytes
+                            db.commit()
+                            is_verified = True
+                            msg = "Face registered locally (Offline)!"
+                        else:
+                            # Verification
+                            stored_emb = np.array(json.loads(student.face_embedding.decode('utf-8')))
+                            curr_emb = np.array(current_embedding)
+
+                            dist = 1 - (np.dot(curr_emb, stored_emb) / (np.linalg.norm(curr_emb) * np.linalg.norm(stored_emb)))
+                            is_match = float(dist) < 0.40
+
+                            if is_match:
+                                is_verified = True
+                                msg = "Face verified locally (Offline)!"
+                            else:
+                                raise HTTPException(status_code=401, detail=f"Face mismatch (Dist: {dist:.2f})")
+                    except Exception as ai_err:
+                        print(f"Local AI Error: {ai_err}")
+                        raise HTTPException(status_code=400, detail=f"AI Error: {str(ai_err)}")
+
+                elif not student.face_embedding:
+                    # FIRST TIME: Extract and Store Embedding via HF Space
                     print(f"--- REGISTRATION: Extracting Face Embedding for {user.username} ---")
 
-                    objs = DeepFace.represent(
-                        img_path = current_path,
-                        model_name = "VGG-Face",
-                        detector_backend = "mtcnn", # Changed from opencv for better detection
-                        enforce_detection = True
-                    )
+                    # Seek to beginning of file for requests
+                    await image.seek(0)
+                    files = {"image": (image.filename, await image.read(), image.content_type)}
+                    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
-                    if objs:
-                        embedding = objs[0]["embedding"]
+                    response = requests.post(f"{HF_API_URL}/represent", files=files, headers=headers, timeout=60)
+
+                    if response.status_code != 200:
+                        print(f"!!! AI Service Error (Reg): {response.status_code} - {response.text} !!!")
+                        raise HTTPException(status_code=500, detail="AI Service (HF) Registration failed. Is the Space running?")
+
+                    try:
+                        result = response.json()
+                    except Exception:
+                        raise HTTPException(status_code=500, detail="AI Service returned invalid data during registration.")
+
+                    if result.get("success"):
+                        embedding = result["embedding"]
                         # Store as JSON string for compatibility
                         student.face_embedding = json.dumps(embedding).encode('utf-8')
 
                         # ALWAYS: Store the actual image binary in Supabase and locally
+                        await image.seek(0)
+                        image_bytes = await image.read()
                         student.face_image = image_bytes
                         db.commit()
 
@@ -990,43 +1063,40 @@ async def verify_face(
 
                         is_verified = True
                         msg = "Face registered and attendance marked!"
-                        print(f"+++ REGISTRATION SUCCESS: {user.username} (Saved to Supabase & Local) +++")
+                        print(f"+++ REGISTRATION SUCCESS: {user.username} (via HF Space) +++")
                     else:
-                        return {"success": False, "message": "Could not detect face for registration."}
+                        return {"success": False, "message": f"AI Error: {result.get('error', 'Face not detected')}"}
                 else:
-                    # SUBSEQUENT TIMES: Verify Embedding
+                    # SUBSEQUENT TIMES: Verify Embedding via HF Space
                     print(f"--- VERIFICATION: Comparing embedding for {user.username} ---")
 
-                    objs = DeepFace.represent(
-                        img_path = current_path,
-                        model_name = "VGG-Face",
-                        detector_backend = "mtcnn", # Changed from opencv for better detection
-                        enforce_detection = True
-                    )
+                    stored_embedding_str = student.face_embedding.decode('utf-8')
 
-                    if not objs:
-                        raise HTTPException(status_code=400, detail="Could not detect face in current scan.")
+                    await image.seek(0)
+                    files = {"image": (image.filename, await image.read(), image.content_type)}
+                    data = {"stored_embedding": stored_embedding_str}
+                    headers = {"Authorization": f"Bearer {HF_TOKEN}"} if HF_TOKEN else {}
 
-                    current_emb = np.array(objs[0]["embedding"])
-                    stored_emb = np.array(json.loads(student.face_embedding.decode('utf-8')))
+                    response = requests.post(f"{HF_API_URL}/verify", files=files, data=data, headers=headers, timeout=60)
 
-                    # Calculate Cosine Distance using numpy
-                    dot_product = np.dot(current_emb, stored_emb)
-                    norm_current = np.linalg.norm(current_emb)
-                    norm_stored = np.linalg.norm(stored_emb)
-                    cosine_similarity = dot_product / (norm_current * norm_stored)
-                    dist = 1 - cosine_similarity
+                    if response.status_code != 200:
+                        print(f"!!! AI Service Error: {response.status_code} - {response.text} !!!")
+                        raise HTTPException(status_code=500, detail=f"AI Service (HF) is currently unavailable (Status {response.status_code})")
 
-                    print(f"DEBUG: Cosine Distance: {dist}")
+                    try:
+                        result = response.json()
+                    except Exception:
+                        raise HTTPException(status_code=500, detail="AI Service returned invalid data. Please try again.")
 
-                    # Threshold for VGG-Face is typically 0.40
-                    if dist < 0.40:
-                        print(f"+++ MATCH FOUND (Distance: {dist}) +++")
+                    if not result.get("success"):
+                        raise HTTPException(status_code=400, detail=f"AI Error: {result.get('error', 'Processing failed')}")
+
+                    if result.get("is_match"):
+                        print(f"+++ MATCH FOUND (Distance: {result.get('distance')}) +++")
                         is_verified = True
                         msg = "Face verified and attendance marked!"
                     else:
-                        print(f"!!! NO MATCH (Distance: {dist}) !!!")
-                        # Use 401 Unauthorized for face mismatch to trigger error UI in App
+                        print(f"!!! NO MATCH (Distance: {result.get('distance')}) !!!")
                         raise HTTPException(status_code=401, detail="Face does not match our records!")
 
             except HTTPException as he:
