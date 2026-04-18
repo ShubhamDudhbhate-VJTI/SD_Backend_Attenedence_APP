@@ -5,11 +5,11 @@ python-multipart==0.0.6
 
 # AI Core
 deepface>=0.0.86
+tensorflow-cpu
 tf-keras
 opencv-python-headless
-numpy==1.24.3
+numpy<2.0.0
 
 # Networking & Utils
 requests
-numpy==1.24.3
-opencv-python-headless
+python-dotenv

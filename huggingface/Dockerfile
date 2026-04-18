@@ -13,19 +13,18 @@ WORKDIR /app
 # Create a non-root user for security (required by Hugging Face)
 RUN useradd -m -u 1000 user
 USER user
+# Set environment variables for TensorFlow stability and cleaner logs
+ENV TF_ENABLE_ONEDNN_OPTS=0
+ENV TF_CPP_MIN_LOG_LEVEL=2
 ENV PATH="/home/user/.local/bin:$PATH"
 
 # Copy requirements and install dependencies
 COPY --chown=user ./requirements.txt requirements.txt
 RUN pip install --no-cache-dir --upgrade -r requirements.txt
 
-# Pre-download the VGG-Face model and MTCNN detector to avoid timeout
-# This makes the Space start faster and more reliable
+# Pre-download the VGG-Face model and MTCNN detector weights
 RUN python -c "from deepface import DeepFace; DeepFace.build_model('VGG-Face')"
-# Trigger a dummy represent call to download detector weights
-RUN python -c "import numpy as np; from deepface import DeepFace; img = np.zeros((224,224,3), dtype=np.uint8); \
-    try: DeepFace.represent(img, model_name='VGG-Face', detector_backend='mtcnn', enforce_detection=False) \
-    except: pass"
+RUN python -c "import numpy as np; from deepface import DeepFace; img = np.zeros((224,224,3), dtype=np.uint8); DeepFace.represent(img, model_name='VGG-Face', detector_backend='mtcnn', enforce_detection=False)"
 
 # Copy the rest of the application
 COPY --chown=user . /app
