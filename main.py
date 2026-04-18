@@ -262,8 +262,10 @@ def get_db():
     finally:
         db.close()
 
-def clean_id(raw_id: str) -> str:
-    return raw_id.strip().replace("\"", "").replace("'", "")
+# Helper to clean IDs from quotes or spaces
+def clean_id(val: str) -> str:
+    if not val: return val
+    return str(val).replace('"', '').replace("'", "").strip()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
