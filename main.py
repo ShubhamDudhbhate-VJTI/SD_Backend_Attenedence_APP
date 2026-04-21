@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 import os
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Body, UploadFile, File, Form, Depends, Response
+from fastapi import FastAPI, HTTPException, Body, UploadFile, File, Form, Depends, Response, BackgroundTasks
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict
@@ -118,6 +118,14 @@ def run_migrations(engine):
                 print("Added branch to app_teachers")
             except Exception: pass
 
+    # Run common migrations for BOTH SQLite and PostgreSQL
+    with engine.begin() as conn:
+        try:
+            conn.execute(text("ALTER TABLE app_users ADD COLUMN fcm_token TEXT"))
+            print("Added fcm_token to app_users")
+        except Exception:
+            pass
+
 # Run migrations immediately
 run_migrations(engine)
 
@@ -131,6 +139,8 @@ class User(Base):
     password_hash = Column(Text)
     full_name = Column(String)
     role = Column(String)
+    fcm_token = Column(String, nullable=True)
+
 
 class Student(Base):
     __tablename__ = "app_students"
@@ -767,8 +777,14 @@ async def mark_notification_read(notification_id: str, db: Session = Depends(get
         return {"success": True}
     raise HTTPException(status_code=404, detail="Notification not found")
 
+@app.post("/notifications/clear/{user_id}")
+async def clear_notifications(user_id: str, db: Session = Depends(get_db)):
+    db.query(Notification).filter(Notification.user_id == user_id).delete()
+    db.commit()
+    return {"success": True}
+
 @app.post("/sessions/start", response_model=SessionResponse)
-async def start_session(req: StartSessionRequest, db: Session = Depends(get_db)):
+async def start_session(req: StartSessionRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     classroom = db.query(Classroom).filter(Classroom.id == req.classroom_id).first()
     room_name = classroom.name if classroom else "Unknown Room"
 
@@ -786,36 +802,45 @@ async def start_session(req: StartSessionRequest, db: Session = Depends(get_db))
         status="active"
     )
     db.add(new_session)
-
-    # Get subject name for notification
-    subject_obj = db.query(Subject).filter(Subject.id == req.subject_id).first()
     db.commit()
 
-    # 1. Notify the Faculty
-    create_notification(
-        db, req.faculty_id,
-        "Session Started",
-        f"You have started a session for {subject_obj.name} in {room_name}."
-    )
-
-    # 2. Notify all students in this branch/year
-    # Use ILIKE or case-insensitive matching for more robustness
-    target_students = db.query(Student).filter(
-        Student.branch.ilike(f"%{subject_obj.branch}%"),
-        Student.year.ilike(f"%{subject_obj.year}%")
-    ).all()
-
-    for student in target_students:
-        create_notification(
-            db, student.id,
-            "Class Started",
-            f"{subject_obj.name} class has started in {room_name}. Mark your attendance!"
-        )
+    # Move the heavy notifications to a background task
+    background_tasks.add_task(send_session_notifications, req.faculty_id, req.subject_id, room_name, sid)
 
     return SessionResponse(
         session_id=sid, qr_token=qr_token, expires_at=expiry.isoformat(),
         classroom_name=room_name
     )
+
+def send_session_notifications(faculty_id: str, subject_id: str, room_name: str, session_id: str):
+    # Use a new DB session for background tasks
+    db = SessionLocal()
+    try:
+        subject_obj = db.query(Subject).filter(Subject.id == subject_id).first()
+        if not subject_obj:
+            return
+
+        # 1. Notify the Faculty
+        create_notification(
+            db, faculty_id,
+            "Session Started",
+            f"You have started a session for {subject_obj.name} in {room_name}."
+        )
+
+        # 2. Notify all students in this branch/year
+        target_students = db.query(Student).filter(
+            Student.branch.ilike(f"%{subject_obj.branch}%"),
+            Student.year.ilike(f"%{subject_obj.year}%")
+        ).all()
+
+        for student in target_students:
+            create_notification(
+                db, student.id,
+                "Class Started",
+                f"{subject_obj.name} class has started in {room_name}. Mark your attendance!"
+            )
+    finally:
+        db.close()
 
 @app.post("/attendance/verify-wifi")
 async def verify_wifi(req: VerifyWifiRequest, db: Session = Depends(get_db)):
@@ -1136,10 +1161,18 @@ async def verify_face(
         db.commit()
 
         # Notify student
+        subject_name = "this session"
+        try:
+            subject = db.query(Subject).filter(Subject.id == session.subject_id).first()
+            if subject:
+                subject_name = subject.name
+        except:
+            pass
+
         create_notification(
             db, user.id,
             "Attendance Marked",
-            f"Your attendance for {session.subject_id} has been recorded as Present."
+            f"Your attendance for {subject_name} has been recorded as Present."
         )
 
         print(f"+++ SUCCESS: {user.full_name} marked present +++")
@@ -1375,24 +1408,21 @@ async def send_custom_notification(request: dict = Body(...), db: Session = Depe
         raise HTTPException(status_code=400, detail="Missing required fields")
 
     notifications_sent = 0
+    target_users = []
 
     if target_type == "individual":
-        # target_id is registration number or user ID
         user = db.query(User).filter((User.username == target_id) | (User.id == target_id)).first()
         if user:
-            create_notification(db, user.id, title, message)
-            notifications_sent = 1
+            target_users.append(user)
         else:
-            # Try to find by registration number in Student table
             student = db.query(Student).filter(Student.registration_number == target_id).first()
             if student:
-                create_notification(db, student.id, title, message)
-                notifications_sent = 1
+                user = db.query(User).filter(User.id == student.id).first()
+                if user: target_users.append(user)
             else:
                 raise HTTPException(status_code=404, detail=f"Student {target_id} not found")
 
     elif target_type == "class":
-        # target_id is "branch-year" e.g., "Information Technology-Second Year"
         if "-" in target_id:
             parts = target_id.split("-")
             branch = parts[0].strip()
@@ -1402,41 +1432,100 @@ async def send_custom_notification(request: dict = Body(...), db: Session = Depe
                 Student.year.ilike(f"%{year}%")
             ).all()
         else:
-            # Fallback to searching only branch if no hyphen
             students = db.query(Student).filter(Student.branch.ilike(f"%{target_id}%")).all()
 
-        for s in students:
-            create_notification(db, s.id, title, message)
-            notifications_sent += 1
+        user_ids = [s.id for s in students]
+        target_users = db.query(User).filter(User.id.in_(user_ids)).all()
 
     elif target_type == "group":
-        # target_id is Subject Name or Code
         subject = db.query(Subject).filter(
             (Subject.name.ilike(f"%{target_id}%")) | (Subject.code.ilike(f"%{target_id}%"))
         ).first()
 
         if subject:
-            # Get all students for this subject's branch and year (assuming whole class)
             students = db.query(Student).filter(
                 Student.branch == subject.branch,
                 Student.year == subject.year
             ).all()
-
-            # Also get minor/elective students
             elective_students = db.query(Student).join(Enrollment, Student.id == Enrollment.student_id).filter(
                 Enrollment.subject_id == subject.id
             ).all()
 
-            # Combine unique students
-            all_target_students = {s.id: s for s in (students + elective_students)}.values()
-
-            for s in all_target_students:
-                create_notification(db, s.id, title, message)
-                notifications_sent += 1
+            user_ids = list(set([s.id for s in (students + elective_students)]))
+            target_users = db.query(User).filter(User.id.in_(user_ids)).all()
         else:
             raise HTTPException(status_code=404, detail=f"Subject {target_id} not found")
 
+    for user in target_users:
+        create_notification(db, user.id, title, message)
+        if user.fcm_token:
+            send_fcm_notification(user.fcm_token, title, message)
+        notifications_sent += 1
+
     return {"success": True, "sent_to": notifications_sent}
+
+def send_fcm_notification(token: str, title: str, body: str):
+    """Placeholder for FCM sending logic. You need to initialize firebase-admin with your service account key."""
+    try:
+        import firebase_admin
+        from firebase_admin import messaging, credentials
+
+        # Check if already initialized
+        if not firebase_admin._apps:
+            try:
+                # 1. Try to load from Environment Variable (for Render)
+                service_account_json = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
+                if service_account_json:
+                    import json
+                    cert_dict = json.loads(service_account_json)
+                    cred = credentials.Certificate(cert_dict)
+                    firebase_admin.initialize_app(cred)
+                else:
+                    # 2. Fallback to local file (for Local Dev)
+                    cred = credentials.Certificate("serviceAccountKey.json")
+                    firebase_admin.initialize_app(cred)
+            except Exception as e:
+                print(f"FCM Error: {str(e)}. No credentials found for Firebase.")
+                return
+
+        message = messaging.Message(
+            notification=messaging.Notification(title=title, body=body),
+            android=messaging.AndroidConfig(
+                priority='high',
+                notification=messaging.AndroidNotification(
+                    sound='default',
+                    channel_id='attendx_urgent_v1',
+                    priority='high',
+                    default_sound=True,
+                    default_vibrate_timings=True,
+                    visibility='public'
+                ),
+            ),
+            data={
+                "title": title,
+                "message": body
+            },
+            token=token,
+        )
+        response = messaging.send(message)
+        print('Successfully sent FCM message:', response)
+    except Exception as e:
+        print('Error sending FCM message:', e)
+
+
+@app.post("/auth/update-fcm")
+async def update_fcm_token(data: dict = Body(...), db: Session = Depends(get_db)):
+    user_id = clean_id(data.get("user_id"))
+    token = data.get("fcm_token")
+    if not user_id or not token:
+        raise HTTPException(status_code=400, detail="Missing user_id or fcm_token")
+
+    user = db.query(User).filter(User.id == user_id).first()
+    if user:
+        user.fcm_token = token
+        db.commit()
+        return {"success": True}
+    raise HTTPException(status_code=404, detail="User not found")
 
 @app.get("/debug/check-setup")
 async def check_setup(db: Session = Depends(get_db)):
