@@ -1041,7 +1041,7 @@ async def verify_face(
                                 is_verified = True
                                 msg = "Face verified locally (Offline)!"
                             else:
-                                raise HTTPException(status_code=401, detail=f"Face mismatch (Dist: {dist:.2f})")
+                                raise HTTPException(status_code=401, detail="Face mismatch")
                     except Exception as ai_err:
                         print(f"Local AI Error: {ai_err}")
                         raise HTTPException(status_code=400, detail=f"AI Error: {str(ai_err)}")
@@ -1114,11 +1114,11 @@ async def verify_face(
                         raise HTTPException(status_code=400, detail=f"AI Error: {result.get('error', 'Processing failed')}")
 
                     if result.get("is_match"):
-                        print(f"+++ MATCH FOUND (Distance: {result.get('distance')}) +++")
+                        print("+++ MATCH FOUND +++")
                         is_verified = True
                         msg = "Face verified and attendance marked!"
                     else:
-                        print(f"!!! NO MATCH (Distance: {result.get('distance')}) !!!")
+                        print("!!! NO MATCH !!!")
                         raise HTTPException(status_code=401, detail="Face does not match our records!")
 
             except HTTPException as he:
@@ -1494,7 +1494,7 @@ def send_fcm_notification(token: str, title: str, body: str):
                 priority='high',
                 notification=messaging.AndroidNotification(
                     sound='default',
-                    channel_id='attendx_urgent_v1',
+                    channel_id='attendx_urgent_v2',
                     priority='high',
                     default_sound=True,
                     default_vibrate_timings=True,
