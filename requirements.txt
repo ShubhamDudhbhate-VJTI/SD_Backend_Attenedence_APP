@@ -21,3 +21,4 @@ passlib[bcrypt]==1.7.4
 requests
 numpy==1.24.3
 opencv-python-headless
+fpdf2==2.7.4
